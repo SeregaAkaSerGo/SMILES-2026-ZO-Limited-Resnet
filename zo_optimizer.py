@@ -137,3 +137,128 @@ class ZeroOrderOptimizer:
         grads = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
         return float(loss_before)
+
+
+
+import torch
+
+
+class ZeroOrderOptimizer:
+    def __init__(self, model):
+        self.model = model
+
+        # Tuned by validate.py for reporting.
+        self.layer_names = ["fc.weight", "fc.bias"]
+
+        self.params = []
+        self.names = []
+        for name, p in self.model.named_parameters():
+            if name in self.layer_names:
+                p.requires_grad_(False)
+                self.names.append(name)
+                self.params.append(p)
+
+        self.step_idx = 0
+
+        # Conservative SPSA hyperparameters.
+        self.eps = 1e-3
+        self.lr = 2e-2
+        self.lr_decay = 0.985
+        self.max_update_norm = 0.05
+
+    @torch.no_grad()
+    def _sample_directions(self):
+        directions = []
+        for p in self.params:
+            # Rademacher noise: {-1, +1}
+            u = torch.empty_like(p)
+            u.bernoulli_(0.5)
+            u.mul_(2.0).sub_(1.0)
+            directions.append(u)
+        return directions
+
+    @torch.no_grad()
+    def _add_perturbation(self, directions, scale):
+        for p, u in zip(self.params, directions):
+            p.add_(u, alpha=scale)
+
+    @torch.no_grad()
+    def _apply_update(self, directions, grad_scalar, lr):
+        # SPSA pseudo-gradient: g * u
+        # Clip global update norm for stability.
+        sq_norm = torch.zeros((), device=self.params[0].device)
+        for u in directions:
+            sq_norm += torch.sum((lr * grad_scalar * u) ** 2)
+
+        update_norm = torch.sqrt(sq_norm).clamp_min(1e-12)
+        clip = min(1.0, float(self.max_update_norm / update_norm.item()))
+
+        for p, u in zip(self.params, directions):
+            p.add_(u, alpha=-lr * grad_scalar * clip)
+
+    @torch.no_grad()
+    def step(self, loss_fn):
+        """
+        Zero-order SPSA step with accept/reject rollback.
+
+        Uses only scalar loss queries:
+        1. f(theta)
+        2. f(theta + eps*u)
+        3. f(theta - eps*u)
+        4. f(theta_new) for accepting/rejecting
+
+        No gradients / backward are used.
+        """
+        self.model.eval()
+
+        lr = self.lr * (self.lr_decay ** self.step_idx)
+        eps = self.eps
+
+        # Current loss on the same batch.
+        base_loss = float(loss_fn().detach().item())
+
+        directions = self._sample_directions()
+
+        # f(theta + eps*u)
+        self._add_perturbation(directions, eps)
+        loss_plus = float(loss_fn().detach().item())
+
+        # f(theta - eps*u)
+        self._add_perturbation(directions, -2.0 * eps)
+        loss_minus = float(loss_fn().detach().item())
+
+        # Restore theta.
+        self._add_perturbation(directions, eps)
+
+        grad_scalar = (loss_plus - loss_minus) / (2.0 * eps)
+
+        # Save old parameters for rollback.
+        old_params = [p.detach().clone() for p in self.params]
+
+        # Try update.
+        self._apply_update(directions, grad_scalar, lr)
+
+        new_loss = float(loss_fn().detach().item())
+
+        # Accept only if current batch loss improves.
+        if new_loss <= base_loss:
+            accepted_loss = new_loss
+        else:
+            for p, old in zip(self.params, old_params):
+                p.copy_(old)
+
+            # Try a smaller step once.
+            small_lr = 0.25 * lr
+            self._apply_update(directions, grad_scalar, small_lr)
+            small_loss = float(loss_fn().detach().item())
+
+            if small_loss <= base_loss:
+                accepted_loss = small_loss
+            else:
+                for p, old in zip(self.params, old_params):
+                    p.copy_(old)
+                accepted_loss = base_loss
+
+        self.step_idx += 1
+
+        return torch.tensor(accepted_loss, device=self.params[0].device)
